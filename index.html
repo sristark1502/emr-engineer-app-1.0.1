@@ -6423,12 +6423,83 @@ function bindNetwork() {
     document.getElementById('offline-banner').classList.remove('show');
     showToast('success', '', 'Back online — syncing.');
     setTimeout(syncOfflineQueue, 1500);
+    sendNetwork();                                                /* added: silent backend report */
   });
   window.addEventListener('offline', () => {
     S.isOnline = false;
     document.getElementById('offline-banner').classList.add('show');
     showToast('warning', '', 'Offline — data saved locally.');
+    sendNetwork();                                                /* added: silent backend report */
   });
+  /* Reactive only — no heartbeat, no UI. Fires on real connection-quality change. */
+  try {
+    var _conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (_conn && _conn.addEventListener) _conn.addEventListener('change', sendNetwork);
+  } catch (e) { /* silently ignored */ }
+}
+
+/* ══════════════════════════════════════════
+   NETWORK STATUS — backend only, no UI, no heartbeat
+   Sends to the same n8n webhook (CFG.WEBHOOK) as type:'network'
+   so the manager dashboard can show GPS + signal for each engineer.
+   Fires only when online/offline/connection-quality actually changes.
+══════════════════════════════════════════ */
+function _classifySignalNet() {
+  if (!navigator.onLine) return { online:false, signal:'offline', bars:0, conn_type:'', effective_type:'', downlink:'', rtt:'' };
+  var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (!c) return { online:true, signal:'good', bars:3, conn_type:'', effective_type:'', downlink:'', rtt:'' };
+  var eff = (c.effectiveType || '').toLowerCase();
+  var dl = c.downlink, rtt = c.rtt;
+  var bars = 3, sig = 'good';
+  if (eff === '4g' || eff === '5g') { bars = 4; sig = 'strong'; }
+  else if (eff === '3g')             { bars = 3; sig = 'good'; }
+  else if (eff === '2g')             { bars = 1; sig = 'weak'; }
+  else if (eff === 'slow-2g')        { bars = 1; sig = 'weak'; }
+  if (typeof dl === 'number') {
+    if (dl >= 5)      { bars = 4; sig = 'strong'; }
+    else if (dl < 0.5){ bars = 1; sig = 'weak';   }
+  }
+  return {
+    online: true, signal: sig, bars: bars,
+    conn_type:      c.type || '',
+    effective_type: c.effectiveType || '',
+    downlink:       (typeof dl  === 'number') ? dl  : '',
+    rtt:            (typeof rtt === 'number') ? rtt : ''
+  };
+}
+/* Side-workflow webhook — separate from the main /emr-data so the main flow stays untouched.
+   Lives in n8n workflow "EMR Network Status" (id: ARTwklptYFoMKWQZ). */
+const NETWORK_WEBHOOK = 'https://srivignesh.app.n8n.cloud/webhook/emr-network';
+async function sendNetwork() {
+  if (!S || !S.engineer) return;
+  var cls = _classifySignalNet();
+  /* Heuristic flight-mode flag: was online a moment ago, now offline */
+  var flight = !navigator.onLine && (S._wasOnline === true);
+  S._wasOnline = navigator.onLine;
+  var payload = {
+    type:           'network',
+    engineer_name:  S.engineer.name,
+    engineer_id:    S.engineer.id,
+    timestamp:      new Date().toISOString(),
+    time_readable:  new Date().toLocaleString('en-IN'),
+    online:         cls.online,
+    flight_mode:    flight,
+    signal:         flight ? 'flight' : cls.signal,
+    bars:           cls.bars,
+    conn_type:      cls.conn_type,
+    effective_type: cls.effective_type,
+    downlink:       cls.downlink,
+    rtt:            cls.rtt,
+    location: { lat: S.gpsLat, lng: S.gpsLng, accuracy: S.gpsAcc }
+  };
+  try {
+    await fetch(NETWORK_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      keepalive: true                                  /* lets the request finish even if app backgrounds */
+    });
+  } catch (e) { /* best-effort, never blocks UI */ }
 }
 
 /* ══════════════════════════════════════════
